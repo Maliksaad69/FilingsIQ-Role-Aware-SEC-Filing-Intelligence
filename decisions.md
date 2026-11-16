@@ -126,6 +126,18 @@ The revised prompt instructs the model not to infer individual case materiality 
 
 **Trade-off:** Status determination requires evidence coverage logic rather than simply checking whether retrieval returned any chunks.
 
+## Decision 14: Strict CLI Interface Contract & Clean JSON Output
+
+**Decision:** Implement the exact command-line interface contract (`ingest <corpus_dir>`, `search --role <role> --k <n> "<question>"`, and `ask --role <role> "<question>"`) with strict, unpolluted JSON stdout outputs and cross-platform executable wrapper scripts.
+
+**Reason:** Automated grading scripts and evaluation harnesses parse stdout as pure JSON (`json.loads(stdout)`). Any diagnostic logs or library warnings printed to stdout break automated parsers.
+
+**Implementation:**
+- `search` outputs a JSON array: `[{"doc_id": "...", "page": 60, "chunk_id": "...", "score": 0.0, "text": "..."}]` where page is a 1-indexed physical PDF page number.
+- `ask` outputs a single JSON object: `{"status": "answered" | "refused", "answer": "...", "citations": [{"doc_id": "...", "page": 60, "chunk_id": "..."}]}`. When refused, citations is an empty list (`[]`).
+- Diagnostic outputs (filters, rewritten queries, progress) are redirected strictly to `stderr`.
+- Executable wrappers (`search`, `ask`, `ingest` for POSIX bash, `.bat` for Windows CMD, and `.ps1` for PowerShell) ensure compatibility regardless of whether the grading harness executes commands directly or via `python main.py`.
+
 ---
 
 ## Decision Log Summary
@@ -141,7 +153,8 @@ The system follows a document-processing and retrieval pipeline:
 7. Store vectors and metadata in Qdrant Cloud.
 8. Enforce role-based access during retrieval.
 9. Retrieve relevant evidence using dense search and query expansion.
-10. Generate grounded answers using Groq.
-11. Return document and page citations with appropriate answer status.
+10. Rerank candidate evidence using Cohere Rerank.
+11. Generate grounded answers using Cohere Command models.
+12. Return document and page citations with clean JSON output conforming to the evaluation interface contract.
 
 **Documentation note:** These decisions describe the current implementation and the experiments performed so far. Decisions and implementation goals should be updated as the system evolves.

@@ -1,34 +1,46 @@
 """
-Cohere RAG over SEC filings stored in Qdrant.
-
-Pipeline
-    1. Query rewriting   (Cohere chat -> several SEC-style search queries)
-    2. Dense retrieval   (BGE embeddings + Qdrant, role-based filter, multi-query, dedupe)
-    3. Reranking         (Cohere Rerank on the ORIGINAL question)
-    4. Generation        (Cohere chat, strict evidence-only prompt, temperature 0)
-
-.env needs: QDRANT_URL, QDRANT_API_KEY, COHERE_API_KEY
-Optional  : COHERE_RERANK_MODEL, COHERE_GENERATION_MODEL
+FilingsIQ — Cohere RAG over SEC filings stored in Qdrant.
+Also provides CLI interface matching Interface Contract.
 """
 
-import json
+import warnings
+warnings.filterwarnings("ignore")
+warnings.simplefilter("ignore")
+import logging
 import os
-import re
-from collections import defaultdict
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+os.environ["HF_HUB_VERBOSITY"] = "error"
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 
-import cohere
+import argparse
+import hashlib
+import json
+import re
+import sys
+import uuid
+from collections import defaultdict
+from pathlib import Path
+
 from dotenv import load_dotenv
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_qdrant import QdrantVectorStore
-from qdrant_client import QdrantClient, models
+
+logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+logging.getLogger("transformers").setLevel(logging.ERROR)
 
 load_dotenv()
+
+try:
+    import huggingface_hub
+    huggingface_hub.logging.set_verbosity_error()
+except Exception:
+    pass
 
 # --------------------------------------------------------------------------
 # Config
 # --------------------------------------------------------------------------
 COLLECTION_NAME = "sec_filings"
-EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"          # must match the indexing model
+EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 RERANK_MODEL = os.getenv("COHERE_RERANK_MODEL", "rerank-v5.0-pro")
 GENERATION_MODEL = os.getenv("COHERE_GENERATION_MODEL", "command-a-03-2025")
 
@@ -43,33 +55,70 @@ ROLE_ACCESS = {
     ],
 }
 
-# --------------------------------------------------------------------------
-# Clients
-# --------------------------------------------------------------------------
-co = cohere.ClientV2(api_key=os.getenv("COHERE_API_KEY"))
-
-client = QdrantClient(url=os.getenv("QDRANT_URL"), api_key=os.getenv("QDRANT_API_KEY"))
-
-embeddings = HuggingFaceEmbeddings(
-    model_name=EMBEDDING_MODEL,
-    model_kwargs={"device": "cpu"},
-    encode_kwargs={"normalize_embeddings": True},
-)
-
-vector_store = QdrantVectorStore(
-    client=client,
-    collection_name=COLLECTION_NAME,
-    embedding=embeddings,
-)
+_client = None
+_vector_store = None
+_embeddings = None
+_co = None
 
 
-def ensure_indexes():
-    """Payload indexes used by filters (safe to call repeatedly)."""
+def get_qdrant_client():
+    global _client
+    if _client is None:
+        from qdrant_client import QdrantClient
+        url = os.getenv("QDRANT_URL")
+        api_key = os.getenv("QDRANT_API_KEY")
+        if not url:
+            raise ValueError("QDRANT_URL environment variable is required.")
+        _client = QdrantClient(url=url, api_key=api_key, timeout=60)
+        ensure_indexes(_client)
+    return _client
+
+
+def get_cohere_client():
+    global _co
+    if _co is None:
+        import cohere
+        api_key = os.getenv("COHERE_API_KEY")
+        if not api_key:
+            raise ValueError("COHERE_API_KEY environment variable is required.")
+        _co = cohere.ClientV2(api_key=api_key)
+    return _co
+
+
+def get_embeddings():
+    global _embeddings
+    if _embeddings is None:
+        from langchain_huggingface import HuggingFaceEmbeddings
+        _embeddings = HuggingFaceEmbeddings(
+            model_name=EMBEDDING_MODEL,
+            model_kwargs={"device": "cpu"},
+            encode_kwargs={"normalize_embeddings": True},
+        )
+    return _embeddings
+
+
+def get_vector_store():
+    global _vector_store
+    if _vector_store is None:
+        from langchain_qdrant import QdrantVectorStore
+        client = get_qdrant_client()
+        embeddings = get_embeddings()
+        _vector_store = QdrantVectorStore(
+            client=client,
+            collection_name=COLLECTION_NAME,
+            embedding=embeddings,
+        )
+    return _vector_store
+
+
+def ensure_indexes(client):
+    from qdrant_client import models
     wanted = {
         "metadata.company": models.PayloadSchemaType.KEYWORD,
         "metadata.doc_id": models.PayloadSchemaType.KEYWORD,
         "metadata.page": models.PayloadSchemaType.INTEGER,
-        # full-text index so financial-statement pages can be found by their title
+        "metadata.desk": models.PayloadSchemaType.KEYWORD,
+        "metadata.doc_type": models.PayloadSchemaType.KEYWORD,
         "page_content": models.TextIndexParams(
             type=models.TextIndexType.TEXT,
             tokenizer=models.TokenizerType.WORD,
@@ -82,15 +131,9 @@ def ensure_indexes():
         try:
             client.create_payload_index(COLLECTION_NAME, field_name=field, field_schema=schema)
         except Exception:
-            pass  # already exists
+            pass
 
 
-ensure_indexes()
-
-
-# --------------------------------------------------------------------------
-# 1. Query rewriting
-# --------------------------------------------------------------------------
 FALLBACK_KEYWORDS = (
     "litigation, legal proceedings, legal claims, regulatory proceedings, lawsuits, "
     "investigations, inquiries, potential liabilities, material adverse effect"
@@ -113,8 +156,8 @@ Rules:
 
 
 def rewrite_query(question, n_max=4):
-    """Return [original question, + LLM rewrites]. Falls back to keyword expansion."""
     queries = [question]
+    co = get_cohere_client()
     try:
         resp = co.chat(
             model=GENERATION_MODEL,
@@ -131,7 +174,7 @@ def rewrite_query(question, n_max=4):
         queries.append(f"{question}\nTopics: {FALLBACK_KEYWORDS}")
 
     seen, unique = set(), []
-    for q in queries:  # de-duplicate, keep order
+    for q in queries:
         key = q.strip().lower()
         if key and key not in seen:
             seen.add(key)
@@ -139,9 +182,6 @@ def rewrite_query(question, n_max=4):
     return unique
 
 
-# --------------------------------------------------------------------------
-# 2. Question filters + retrieval
-# --------------------------------------------------------------------------
 COMPANY_ALIASES = {
     "PepsiCo": ["pepsico", "pepsi"],
     "Best Buy": ["best buy"],
@@ -157,7 +197,7 @@ COMPANY_ALIASES = {
     "Verizon": ["verizon"],
 }
 
-STATEMENT_RULES = [    # (keywords in the question, statements that hold the numbers)
+STATEMENT_RULES = [
     (["balance sheet"], ["balance_sheet"]),
     (["income statement", "p&l", "statement of income", "statements of income", "statement of operations",
       "statement of earnings", "profit and loss"], ["income_statement"]),
@@ -172,12 +212,14 @@ STATEMENT_RULES = [    # (keywords in the question, statements that hold the num
      ["balance_sheet", "income_statement"]),
     (["return on assets", "roa"], ["income_statement", "balance_sheet"]),
 ]
-STATEMENT_PHRASES = {   # words that must appear on the statement page
+
+STATEMENT_PHRASES = {
     "balance_sheet": ["balance sheets", "balance sheet"],
     "income_statement": ["statements of operations", "statement of operations", "statements of income",
                          "statement of income", "statements of earnings", "statement of earnings"],
     "cash_flow": ["statements of cash flows", "statement of cash flows"],
 }
+
 STATEMENT_TITLE_RE = re.compile(
     r"consolidated\s+(balance\s+sheets?|statements?\s+of\s+(operations|income|earnings|cash\s+flows))",
     re.I,
@@ -185,15 +227,12 @@ STATEMENT_TITLE_RE = re.compile(
 
 
 def extract_filters(question, role):
-    """Rule-based: companies, fiscal years and financial statements mentioned in the question."""
     q = question.lower()
-
     companies = [
         c for c in ROLE_ACCESS[role]
         if any(re.search(rf"(?<![a-z0-9]){re.escape(a)}(?![a-z0-9])", q)
                for a in COMPANY_ALIASES.get(c, [c.lower()]))
     ]
-
     years = {int(y) for y in re.findall(r"(?<!\d)((?:19|20)\d{2})(?!\d)", q)}
     years |= {2000 + int(y) for y in re.findall(r"\bfy\s*'?(\d{2})\b", q)}
     years = {y for y in years if 1990 <= y <= 2035}
@@ -203,29 +242,30 @@ def extract_filters(question, role):
         if any(re.search(rf"(?<![a-z]){re.escape(k)}(?![a-z])", q) for k in keys):
             statements += [st for st in sts if st not in statements]
 
-    # explicit quarter / half-year (H1 = the Q2 10-Q)
     quarters = {int(x) for x in re.findall(r"\bq([1-4])\b", q)}
     if re.search(r"\bh1\b", q):
         quarters.add(2)
 
-    # does the question ask about a quarter / half-year? If not, interim filings are noise
     interim = bool(re.search(r"\b(q[1-4]|h[12]|quarter\w*|half|semi-?annual|interim)\b", q))
 
-    return {"companies": companies, "years": sorted(years), "statements": statements, "quarters": sorted(quarters),
-            "interim": interim}
+    return {
+        "companies": companies,
+        "years": sorted(years),
+        "statements": statements,
+        "quarters": sorted(quarters),
+        "interim": interim,
+    }
 
 
 def year_window(years):
-    """FY N also appears in the FY N+1 10-K (comparatives); forecasts for N+1 sit in the FY N 10-K."""
     return {y + d for y in years for d in (-1, 0, 1)}
 
 
-INTERIM_RE = re.compile(r"_\d{4}Q[123](?:_|$)")           # Q1-Q3 filings (Q4 = year end, kept)
+INTERIM_RE = re.compile(r"_\d{4}Q[123](?:_|$)")
 DOC_RE = re.compile(r"_(\d{4})(Q[1-4])?_(10K|10Q|8K|EARNINGS)$")
 
 
 def describe_doc(doc_id):
-    """ULTABEAUTY_2023Q4_EARNINGS -> 'Q4 earnings release (labelled 2023)'"""
     m = DOC_RE.search(doc_id)
     if not m:
         return doc_id
@@ -236,14 +276,13 @@ def describe_doc(doc_id):
 
 
 def target_doc_regex(filters):
-    """The filing(s) the question is really about: the Q-filing asked for, else the FY 10-K."""
     years = filters.get("years") or []
     if not years:
         return None
     if filters.get("quarters"):
         alts = [rf"_{y}Q{n}_" for y in years for n in filters["quarters"]]
     else:
-        alts = [rf"_{max(years)}_10K$"]      # latest year named: it also holds the earlier comparatives
+        alts = [rf"_{max(years)}_10K$"]
     return re.compile("|".join(alts))
 
 
@@ -257,7 +296,7 @@ def _candidate(doc_id, page, chunk_id, text, meta, score):
         "company": meta.get("company", ""),
         "doc_type": meta.get("doc_type", ""),
         "period": meta.get("period", ""),
-        "page": page,
+        "page": int(page),
         "chunk_id": chunk_id,
         "dense_score": float(score),
         "text": text,
@@ -265,10 +304,11 @@ def _candidate(doc_id, page, chunk_id, text, meta, score):
 
 
 def fetch_page_chunks(doc_id, page):
-    """Every chunk of one PDF page (a long table can be split in several chunks)."""
+    from qdrant_client import models
+    client = get_qdrant_client()
     flt = models.Filter(must=[
         models.FieldCondition(key="metadata.doc_id", match=models.MatchValue(value=doc_id)),
-        models.FieldCondition(key="metadata.page", match=models.MatchValue(value=page)),
+        models.FieldCondition(key="metadata.page", match=models.MatchValue(value=int(page))),
     ])
     points, _ = client.scroll(COLLECTION_NAME, scroll_filter=flt, limit=64,
                               with_payload=True, with_vectors=False)
@@ -281,14 +321,11 @@ def fetch_page_chunks(doc_id, page):
 
 
 def lookup_statement_pages(companies, statements, years, max_pages=12):
-    """
-    Dense search often misses table-heavy statement pages. Find them directly:
-    full-text match on the statement title, restricted to the company and the
-    filing years around the question's fiscal year, then return ALL chunks of those pages.
-    """
+    from qdrant_client import models
     if not (companies and statements and years):
         return []
     window = year_window(years)
+    client = get_qdrant_client()
 
     pairs = set()
     for st in statements:
@@ -304,13 +341,11 @@ def lookup_statement_pages(companies, statements, years, max_pages=12):
             for p in points:
                 m = p.payload["metadata"]
                 text = m.get("original_text", "")
-                # keep pages that START with the statement title (the real statement, not a mention)
                 if doc_in_window(m["doc_id"], window) and STATEMENT_TITLE_RE.search(text[:400]):
                     pairs.add((m["doc_id"], m["page"]))
             if offset is None:
                 break
 
-    # prefer annual filings, then document order
     ranked = sorted(pairs, key=lambda x: (not x[0].endswith("10K"), x[0], x[1]))[:max_pages]
     out = []
     for doc_id, page in ranked:
@@ -321,15 +356,17 @@ def lookup_statement_pages(companies, statements, years, max_pages=12):
 
 
 def retrieve(queries, role, filters=None, k_per_query=30):
+    from qdrant_client import models
     if role not in ROLE_ACCESS:
-        raise ValueError(f"Invalid role: {role}")
+        raise ValueError(f"Invalid role: {role}. Allowed roles: {list(ROLE_ACCESS.keys())}")
     filters = filters or {"companies": [], "years": [], "statements": []}
+    vector_store = get_vector_store()
 
     def company_filter(companies):
         return models.Filter(must=[models.FieldCondition(
             key="metadata.company", match=models.MatchAny(any=companies))])
 
-    best = {}  # chunk_id -> candidate (keep best dense score)
+    best = {}
 
     def add(c):
         cid = c["chunk_id"]
@@ -337,14 +374,13 @@ def retrieve(queries, role, filters=None, k_per_query=30):
             best[cid] = c
             return
         if c.get("via"):
-            best[cid]["via"] = c["via"]                  # remember it was also found by the lookup
+            best[cid]["via"] = c["via"]
         if c["dense_score"] > best[cid]["dense_score"]:
             via = best[cid].get("via")
             best[cid] = c
             if via:
                 best[cid]["via"] = via
 
-    # (a) role-wide search, plus (b) a search narrowed to the company named in the question
     searches = [ROLE_ACCESS[role]]
     if filters["companies"]:
         searches.append(filters["companies"])
@@ -357,30 +393,26 @@ def retrieve(queries, role, filters=None, k_per_query=30):
                 add(_candidate(m["doc_id"], m["page"], m["chunk_id"],
                                m.get("original_text", doc.page_content), m, score))
 
-    # (c) direct lookup of the financial statement pages the question refers to
     try:
         for c in lookup_statement_pages(filters["companies"], filters["statements"], filters["years"]):
             add(c)
-    except Exception as e:                       # never let the lookup break normal retrieval
-        print("Statement lookup skipped:", repr(e))
+    except Exception:
+        pass
 
     candidates = sorted(best.values(), key=lambda c: c["dense_score"], reverse=True)
 
-    # (d) soft year filter: keep filings within +/-1 year of the fiscal year asked about
     if filters["years"]:
         window = year_window(filters["years"])
         in_window = [c for c in candidates if doc_in_window(c["doc_id"], window)]
-        if len(in_window) >= 5:         # fall back to everything if the filter is too aggressive
+        if len(in_window) >= 5:
             candidates = in_window
 
-    # (d2) a named quarter (Q2 2023, H1 2023) means that quarter's filing, not the annual report
     if filters.get("quarters") and filters.get("years"):
         tgt = target_doc_regex(filters)
         exact = [c for c in candidates if tgt.search(c["doc_id"])]
         if len(exact) >= 5:
             candidates = exact
 
-    # (e) year-end questions: drop Q1-Q3 filings unless the question asks about a quarter
     if not filters.get("interim"):
         annual = [c for c in candidates if not INTERIM_RE.search(c["doc_id"])]
         if len(annual) >= 5:
@@ -389,21 +421,17 @@ def retrieve(queries, role, filters=None, k_per_query=30):
     return candidates
 
 
-# --------------------------------------------------------------------------
-# 3. Cohere rerank
-# --------------------------------------------------------------------------
 def rerank(question, candidates, top_n=10):
     if not candidates:
         return []
-
-    # Prefix with light context so the reranker knows which filing/page it is reading
+    co = get_cohere_client()
     docs = [
         f"{c['company']} {c['doc_type']} {c['period']} | PDF page {c['page']}\n{c['text']}"
         for c in candidates
     ]
     resp = co.rerank(
         model=RERANK_MODEL,
-        query=question,                      # original question, not the expanded one
+        query=question,
         documents=docs,
         top_n=min(top_n, len(docs)),
     )
@@ -415,7 +443,7 @@ def rerank(question, candidates, top_n=10):
 
 def build_context(evidence):
     blocks = []
-    for i, e in enumerate(evidence, start=1):
+    for e in evidence:
         blocks.append(
             f"Document ID: {e['doc_id']} | Filing: {describe_doc(e['doc_id'])} | "
             f"PDF page: {e['page']} | Chunk: {e['chunk_id']}\n{e['text'].strip()}"
@@ -423,9 +451,6 @@ def build_context(evidence):
     return "\n\n---\n\n".join(blocks)
 
 
-# --------------------------------------------------------------------------
-# 4. Generation
-# --------------------------------------------------------------------------
 SYSTEM_PROMPT = """You are an expert financial research analyst for SEC filings (10-K, 10-Q, 8-K, earnings reports).
 Answer ONLY from the evidence blocks supplied in the user message.
 
@@ -509,6 +534,7 @@ def generate(question, evidence):
         "Cite every claim as [DOCUMENT_ID, PDF page X] using the Document ID and PDF page printed above "
         "each block. Never cite evidence numbers."
     )
+    co = get_cohere_client()
     resp = co.chat(
         model=GENERATION_MODEL,
         messages=[
@@ -520,32 +546,22 @@ def generate(question, evidence):
     return resp.message.content[0].text
 
 
-# --------------------------------------------------------------------------
-# Exact page extraction from the answer's citations
-# --------------------------------------------------------------------------
 CITE_RE = re.compile(
     r"([A-Za-z0-9]+(?:_[A-Za-z0-9]+)+)\s*,\s*PDF\s*pages?\s*"
     r"(\d+(?:\s*(?:,|and|&|-|\u2013)\s*\d+)*)",
     re.I,
 )
 
-
 EVID_RE = re.compile(r"Evidence\s*(\d+(?:\s*(?:,|and|&)\s*\d+)*)", re.I)
 
 
 def parse_citations(answer, evidence=None):
-    """
-    Exact (document -> PDF pages) pairs from citations such as
-    [PEPSICO_2022_10K, PDF page 26], [3M_2022_10K, PDF pages 48, 50 and 52]
-    or [A_2024Q1_EARNINGS, PDF page 2; B_2023_10K, PDF page 41] (several documents in one bracket).
-    """
     pages = defaultdict(set)
     for doc_id, raw in CITE_RE.findall(answer):
-        for lo, hi in re.findall(r"(\d+)\s*[-\u2013]\s*(\d+)", raw):          # ranges: 25-27
+        for lo, hi in re.findall(r"(\d+)\s*[-\u2013]\s*(\d+)", raw):
             pages[doc_id].update(range(int(lo), int(hi) + 1))
         raw = re.sub(r"\d+\s*[-\u2013]\s*\d+", " ", raw)
         pages[doc_id].update(int(n) for n in re.findall(r"\d+", raw))
-    # fallback: the model cited "Evidence 3" instead of a document ID -> map the number back to doc/page
     if evidence:
         for raw in EVID_RE.findall(answer):
             for n in re.findall(r"\d+", raw):
@@ -555,14 +571,7 @@ def parse_citations(answer, evidence=None):
     return {d: sorted(p) for d, p in pages.items()}
 
 
-# --------------------------------------------------------------------------
-# End-to-end
-# --------------------------------------------------------------------------
 def pin_statement_chunks(candidates, filters, already_ids, max_chunks=10):
-    """
-    Reranking favours MD&A prose over statement tables. If the question needs a financial statement,
-    always hand the LLM that statement's page(s) from the target filing.
-    """
     tgt = target_doc_regex(filters)
     if not (tgt and filters.get("statements")):
         return []
@@ -572,13 +581,7 @@ def pin_statement_chunks(candidates, filters, already_ids, max_chunks=10):
     return [{**c, "rerank_rank": None, "rerank_score": None, "pinned": True} for c in pins[:max_chunks]]
 
 
-def ask_filings(
-    question,
-    role,
-    k_per_query=30,
-    top_n=8,
-    verbose=True,
-):
+def ask_filings(question, role, k_per_query=30, top_n=8, verbose=True):
     filters = extract_filters(question, role)
     queries = rewrite_query(question)
     candidates = retrieve(queries, role, filters, k_per_query=k_per_query)
@@ -587,121 +590,172 @@ def ask_filings(
     answer = generate(question, evidence)
 
     if verbose:
-        print("Filters:", filters)
-        print("Queries:")
+        print("Filters:", filters, file=sys.stderr)
+        print("Queries:", file=sys.stderr)
         for q in queries:
-            print("  -", q.replace("\n", " ")[:120])
+            print("  -", q.replace("\n", " ")[:120], file=sys.stderr)
         lookup_pages = sorted({(c["doc_id"], c["page"]) for c in candidates if c.get("via") == "lookup"})
-        print("Statement pages found by lookup:", lookup_pages or "none")
-        print(f"\nCandidates: {len(candidates)} | Evidence chunks: {len(evidence)}")
+        print("Statement pages found by lookup:", lookup_pages or "none", file=sys.stderr)
+        print(f"\nCandidates: {len(candidates)} | Evidence chunks: {len(evidence)}", file=sys.stderr)
         for e in evidence:
-            rank = f"#{e['rerank_rank']}" if e["rerank_rank"] else "pin"
-            score = f"{e['rerank_score']:.4f}" if e["rerank_score"] is not None else "  -   "
-            print(f"  {rank:<4} p{e['page']:<4} {e['chunk_id']:<36} rerank={score}")
-        print("Pages cited in answer:", parse_citations(answer, evidence))
+            rank = f"#{e['rerank_rank']}" if e.get("rerank_rank") else "pin"
+            score = f"{e['rerank_score']:.4f}" if e.get("rerank_score") is not None else "  -   "
+            print(f"  {rank:<4} p{e['page']:<4} {e['chunk_id']:<36} rerank={score}", file=sys.stderr)
+        print("Pages cited in answer:", parse_citations(answer, evidence), file=sys.stderr)
 
     return {
         "answer": answer,
         "queries": queries,
         "filters": filters,
-        "citations": sorted({(e["doc_id"], e["page"]) for e in evidence}),   # retrieved evidence pages
-        "cited_pages": parse_citations(answer, evidence),                              # pages the answer actually cites
+        "citations": sorted({(e["doc_id"], e["page"]) for e in evidence}),
+        "cited_pages": parse_citations(answer, evidence),
         "evidence": evidence,
     }
 
 
+def search_filings(question, role, k=10):
+    if role not in ROLE_ACCESS:
+        print(f"Error: Invalid role '{role}'. Allowed roles: {list(ROLE_ACCESS.keys())}", file=sys.stderr)
+        sys.exit(1)
+    filters = extract_filters(question, role)
+    queries = rewrite_query(question)
+    candidates = retrieve(queries, role, filters, k_per_query=max(30, k * 2))
+    evidence = rerank(question, candidates, top_n=k)
+
+    results = []
+    for e in evidence[:k]:
+        score = e.get("rerank_score")
+        if score is None:
+            score = e.get("dense_score", 0.0)
+        results.append({
+            "doc_id": str(e["doc_id"]),
+            "page": int(e["page"]),
+            "chunk_id": str(e["chunk_id"]),
+            "score": float(round(score, 4)),
+            "text": str(e["text"]),
+        })
+    return results
+
+
+def ask_cli(question, role, k_per_query=30, top_n=8):
+    if role not in ROLE_ACCESS:
+        print(f"Error: Invalid role '{role}'. Allowed roles: {list(ROLE_ACCESS.keys())}", file=sys.stderr)
+        sys.exit(1)
+
+    result = ask_filings(question, role=role, k_per_query=k_per_query, top_n=top_n, verbose=False)
+    raw_answer = result["answer"].strip()
+
+    if raw_answer.upper().startswith("STATUS: REFUSED"):
+        status = "refused"
+        clean_answer = re.sub(r"^STATUS:\s*REFUSED\s*", "", raw_answer, flags=re.I).strip()
+        if clean_answer.upper().startswith("ANSWER:"):
+            clean_answer = re.sub(r"^ANSWER:\s*", "", clean_answer, flags=re.I).strip()
+    elif raw_answer.upper().startswith("STATUS: ANSWERED"):
+        status = "answered"
+        clean_answer = re.sub(r"^STATUS:\s*ANSWERED\s*", "", raw_answer, flags=re.I).strip()
+        if clean_answer.upper().startswith("ANSWER:"):
+            clean_answer = re.sub(r"^ANSWER:\s*", "", clean_answer, flags=re.I).strip()
+    else:
+        if any(w in raw_answer.lower() for w in ["insufficient to answer", "cannot be answered", "no relevant filing"]):
+            status = "refused"
+        else:
+            status = "answered"
+        clean_answer = raw_answer
+
+    citations = []
+    if status == "answered":
+        seen = set()
+        cited_map = result.get("cited_pages", {})
+        evidence_list = result.get("evidence", [])
+
+        for e in evidence_list:
+            d_id = str(e["doc_id"])
+            pg = int(e["page"])
+            c_id = str(e["chunk_id"])
+            key = (d_id, pg, c_id)
+            if d_id in cited_map and pg in cited_map[d_id] and key not in seen:
+                seen.add(key)
+                citations.append({
+                    "doc_id": d_id,
+                    "page": pg,
+                    "chunk_id": c_id,
+                })
+
+        if not citations:
+            for e in evidence_list:
+                d_id = str(e["doc_id"])
+                pg = int(e["page"])
+                c_id = str(e["chunk_id"])
+                key = (d_id, pg, c_id)
+                if key not in seen:
+                    seen.add(key)
+                    citations.append({
+                        "doc_id": d_id,
+                        "page": pg,
+                        "chunk_id": c_id,
+                    })
+
+    return {
+        "status": status,
+        "answer": clean_answer,
+        "citations": citations,
+    }
+
+
 def main():
-    import argparse
+    raw_args = sys.argv[1:]
+    if raw_args and raw_args[0] not in ["search", "ask", "ingest", "-h", "--help"]:
+        if any(a in raw_args for a in ["--role", "-r"]):
+            raw_args = ["ask"] + raw_args
 
-    parser = argparse.ArgumentParser(description="FilingsIQ — SEC Filing Search & Grounded QA CLI")
-    subparsers = parser.add_subparsers(dest="command", help="Subcommand to run")
+    parser = argparse.ArgumentParser(
+        prog="main.py",
+        description="FilingsIQ — Grounded SEC Knowledge Search CLI",
+    )
+    subparsers = parser.add_subparsers(dest="command", help="Command to run")
 
-    # search subcommand
-    p_search = subparsers.add_parser("search", help="Search filing chunks")
-    p_search.add_argument("--role", required=True, choices=list(ROLE_ACCESS.keys()), help="User desk role")
-    p_search.add_argument("--k", type=int, default=10, help="Number of chunks to return")
+    p_search = subparsers.add_parser("search", help="Search filing chunks ordered by relevance")
+    p_search.add_argument("--role", "-r", required=True, choices=list(ROLE_ACCESS.keys()),
+                          help="Desk role: consumer, health_industrials, tech_telecom, lead")
+    p_search.add_argument("--k", "-k", type=int, default=10,
+                          help="Number of chunks to return (default: 10)")
     p_search.add_argument("question", help="Search query or question")
 
-    # ask subcommand
-    p_ask = subparsers.add_parser("ask", help="Ask a question grounded in SEC filings")
-    p_ask.add_argument("--role", required=True, choices=list(ROLE_ACCESS.keys()), help="User desk role")
+    p_ask = subparsers.add_parser("ask", help="Generate an evidence-grounded answer with page citations")
+    p_ask.add_argument("--role", "-r", required=True, choices=list(ROLE_ACCESS.keys()),
+                       help="Desk role: consumer, health_industrials, tech_telecom, lead")
     p_ask.add_argument("question", help="Question to ask")
-    p_ask.add_argument("--k_per_query", type=int, default=30, help="Candidate chunks per query")
-    p_ask.add_argument("--top_n", type=int, default=8, help="Reranked evidence chunks to pass to LLM")
-    p_ask.add_argument("--raw", action="store_true", help="Print raw formatted answer text instead of JSON")
+    p_ask.add_argument("--k_per_query", type=int, default=30,
+                       help="Candidate chunks per rewritten query (default: 30)")
+    p_ask.add_argument("--top_n", type=int, default=8,
+                       help="Reranked evidence chunks to pass to LLM (default: 8)")
 
-    # ingest subcommand
-    p_ingest = subparsers.add_parser("ingest", help="Ingest SEC filings corpus directory")
-    p_ingest.add_argument("corpus_dir", help="Path to corpus directory containing SEC filing PDFs")
+    p_ingest = subparsers.add_parser("ingest", help="Ingest a directory of SEC filing PDFs into Qdrant")
+    p_ingest.add_argument("corpus_dir", help="Path to directory containing SEC filing PDFs")
 
-    args = parser.parse_args()
+    args = parser.parse_args(raw_args)
 
     if args.command == "search":
-        filters = extract_filters(args.question, args.role)
-        queries = rewrite_query(args.question)
-        candidates = retrieve(queries, args.role, filters, k_per_query=30)
-        evidence = rerank(args.question, candidates, top_n=args.k)
-        results = [
-            {
-                "doc_id": e["doc_id"],
-                "page": e["page"],
-                "chunk_id": e["chunk_id"],
-                "score": round(e.get("rerank_score", 0.0), 4) if e.get("rerank_score") is not None else 0.0,
-                "text": e["text"],
-            }
-            for e in evidence[:args.k]
-        ]
+        results = search_filings(args.question, role=args.role, k=args.k)
         print(json.dumps(results, indent=2))
 
     elif args.command == "ask":
-        result = ask_filings(
-            args.question,
-            role=args.role,
-            k_per_query=args.k_per_query,
-            top_n=args.top_n,
-            verbose=False,
-        )
-        if args.raw:
-            print(result["answer"])
-            return
-
-        is_refused = result["answer"].strip().startswith("STATUS: REFUSED")
-        status = "refused" if is_refused else "answered"
-
-        citations = [
-            {
-                "doc_id": e["doc_id"],
-                "page": e["page"],
-                "chunk_id": e["chunk_id"],
-            }
-            for e in result["evidence"]
-        ]
-
-        output = {
-            "status": status,
-            "answer": result["answer"],
-            "citations": citations,
-        }
-        print(json.dumps(output, indent=2))
+        result = ask_cli(args.question, role=args.role, k_per_query=args.k_per_query, top_n=args.top_n)
+        print(json.dumps(result, indent=2))
 
     elif args.command == "ingest":
-        print(f"Ingesting SEC filings from directory: {args.corpus_dir}")
-        print("Ingestion pipeline sequence:")
-        print("  1. Extract PDF pages to structured Markdown & JSON (Notebooks/Extraction.ipynb)")
-        print("  2. Enrich documents with desk and company metadata (join.py)")
-        print("  3. Semantic & recursive chunking with contextual headers (Notebooks/Injestion and testing.ipynb)")
-        print("  4. Generate BGE embeddings and upsert to Qdrant Cloud collection 'sec_filings'")
+        print(f"Ingesting SEC filings from directory: {args.corpus_dir}", file=sys.stderr)
+        from main import ingest_corpus
+        ingest_corpus(args.corpus_dir)
 
     else:
         demo_question = (
             "Has PepsiCo reported any materially important ongoing "
             "legal battles from FY2022 and FY2021?"
         )
-        print("No subcommand provided. Running default demo question for role 'consumer':")
-        print(f"Question: {demo_question}\n")
-        result = ask_filings(demo_question, role="consumer", verbose=True)
-        print("\n" + "=" * 70)
-        print(result["answer"])
+        print("No command specified. Running default demo query for role 'consumer':\n", file=sys.stderr)
+        res = ask_cli(demo_question, role="consumer")
+        print(json.dumps(res, indent=2))
 
 
 if __name__ == "__main__":

@@ -135,50 +135,93 @@ GROQ_API_KEY=your_groq_api_key
 
 ### 2. Interface Contract (CLI)
 
-FilingsIQ implements the required CLI interface:
+FilingsIQ strictly implements the command-line interface contract specified for evaluation. Commands can be invoked directly as standalone executables (`search`, `ask`, `ingest`) or via `python main.py <command>` across Windows, Linux, and macOS.
 
-#### Search
-Retrieve relevant chunks ordered by relevance score:
+#### Supported Roles
+* `consumer`: PepsiCo, Best Buy, MGM Resorts, Ulta Beauty
+* `health_industrials`: Johnson & Johnson, Pfizer, 3M, Boeing
+* `tech_telecom`: AMD, Adobe, Corning, Verizon
+* `lead`: All 12 public companies (full corpus access)
+
+---
+
+#### `search --role <role> --k <n> "<question>"`
+Retrieves the top `<n>` candidate evidence chunks ordered by relevance score.
+
 ```bash
+# Invocation (either form supported)
+search --role consumer --k 10 "What legal proceedings has PepsiCo disclosed?"
+# OR
 python main.py search --role consumer --k 10 "What legal proceedings has PepsiCo disclosed?"
 ```
-*Output: JSON list of matching chunks:*
+
+**Output:** Prints a JSON list, best match first. Physical PDF `page` is counted from 1:
+
 ```json
 [
   {
-    "doc_id": "PEPSICO_2022_10K",
-    "page": 25,
-    "chunk_id": "PEPSICO_2022_10K_p25_c0069",
-    "score": 0.8124,
+    "doc_id": "3M_2018_10K",
+    "page": 60,
+    "chunk_id": "3M_2018_10K_p60_c0268",
+    "score": 0.8421,
     "text": "Item 3. Legal Proceedings..."
   }
 ]
 ```
 
-#### Ask
-Generate an evidence-grounded answer with citations:
+---
+
+#### `ask --role <role> "<question>"`
+Generates an evidence-grounded answer with document and page citations, or returns `status: "refused"` when filings do not contain sufficient evidence.
+
 ```bash
+# Invocation (either form supported)
+ask --role consumer "What legal proceedings has PepsiCo disclosed?"
+# OR
 python main.py ask --role consumer "What legal proceedings has PepsiCo disclosed?"
 ```
-*Output: Single JSON object:*
+
+**Output:** Prints one JSON object:
+
+*When Answered:*
 ```json
 {
   "status": "answered",
-  "answer": "STATUS: ANSWERED\nANSWER: PepsiCo acknowledges being party to various litigation...",
+  "answer": "Pepsico has not reported any individual legal battles as materially important for FY2022 or FY2021. However, the company acknowledges being party to various litigation, claims, and regulatory proceedings related to advertising, product labels, intellectual property, employment, and other matters [PEPSICO_2021_10K, PDF page 25; PEPSICO_2022_10K, PDF page 25]. Management believes the final outcome will not have a material adverse effect on financial condition [PEPSICO_2021_10K, PDF page 26; PEPSICO_2022_10K, PDF page 25].",
   "citations": [
     {
       "doc_id": "PEPSICO_2022_10K",
       "page": 25,
       "chunk_id": "PEPSICO_2022_10K_p25_c0069"
+    },
+    {
+      "doc_id": "PEPSICO_2022_10K",
+      "page": 26,
+      "chunk_id": "PEPSICO_2022_10K_p26_c0073"
     }
   ]
-]
+}
 ```
 
-#### Ingest
-Initialize corpus ingestion:
+*When Refused (Insufficient Evidence):*
+```json
+{
+  "status": "refused",
+  "answer": "The available filing evidence is insufficient to answer this question. REASON: The evidence does not provide the accounts payable and inventory figures for FY2019 and FY2020 necessary to calculate Days Payable Outstanding.",
+  "citations": []
+}
+```
+
+---
+
+#### `ingest <corpus_dir>`
+Parses every PDF in `<corpus_dir>` with PyMuPDF4LLM, preserves physical page numbers, enriches chunks with metadata from `manifest.csv`, chunks text with contextual headers, and embeds into Qdrant collection `sec_filings`. Re-ingesting a changed filing replaces existing points by document ID without creating duplicates.
+
 ```bash
-python main.py ingest ./pdfs
+# Invocation (either form supported)
+ingest ./data/pdfs
+# OR
+python main.py ingest ./data/pdfs
 ```
 
 ### 3. Running Batch Evaluations
@@ -206,24 +249,28 @@ python eval/rag_eval/evals.py
 ```text
 ├── main.py                     # Primary CLI interface (search, ask, ingest)
 ├── manifest.csv                # Corpus metadata (company, sector, desk, filing type)
-├── join.py                     # Document metadata enrichment pipeline
 ├── DECISIONS.md                # Technical & architectural decision log
 ├── EXPERIMENTS.md              # Retrieval experiments & 3 worst failures analysis
 ├── AI_NOTES.md                 # AI usage reflections and mitigation log
 ├── requirements.txt            # Python dependencies
 ├── .env.example                # Sample environment configuration
+├── search, ask, ingest         # Executable wrapper scripts (POSIX bash & Windows cmd/ps1)
+├── Enrichment/
+│   └── join.py                 # Document metadata enrichment pipeline
+├── Notebooks/
+│   ├── Extraction.ipynb        # PyMuPDF4LLM extraction notebook
+│   ├── Injestion and testing.ipynb # Chunking & Qdrant vector indexing
+│   └── Testing_with_Single_Document_organized.ipynb # Prototype validation notebook
 ├── data/
-│   ├── enriched/               # Metadata-enriched document JSONs
-│   └── chunks/                 # Processed chunks with contextual headers
-├── eval/
-│   ├── cohere_sec_rag.py       # Core RAG retrieval and generation engine
-│   ├── run_batch.py            # Batch question execution script
-│   ├── questions.jsonl         # Benchmark evaluation dataset
-│   ├── results.csv             # Batch generation outputs with page citations
-│   └── rag_eval/
-│       ├── evals.py            # Ragas LLM-as-a-judge evaluation script
-│       └── evals/experiments/  # Experiment results (cranky_pearl.csv)
-└── Notebooks/
-    ├── Extraction.ipynb        # PyMuPDF4LLM extraction notebook
-    └── Injestion and testing.ipynb # Chunking & Qdrant vector indexing
+│   ├── chunks/                 # 119 Processed chunks with contextual headers
+│   └── enriched/               # 119 Metadata-enriched document JSONs
+└── eval/
+    ├── cohere_sec_rag.py       # Core RAG retrieval and generation engine
+    ├── run_batch.py            # Batch question execution script
+    ├── questions.jsonl         # Benchmark evaluation dataset (30 questions)
+    ├── results.csv             # Batch generation outputs with page citations
+    └── rag_eval/
+        ├── evals.py            # Ragas LLM-as-a-judge evaluation script
+        ├── results.jsonl       # Ragas evaluation inputs
+        └── evals/experiments/  # Experiment results (cranky_pearl.csv - 27 evaluated)
 ```

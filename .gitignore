@@ -1,3 +1,21 @@
+# Environment & credentials
 .env
-venv
-/data
+
+# Virtual environment
+venv/
+.venv/
+
+# Large local raw data (if kept outside Git)
+/data/pdfs/
+
+# Python cache & build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# Operating system artifacts
+.DS_Store
+Thumbs.db
