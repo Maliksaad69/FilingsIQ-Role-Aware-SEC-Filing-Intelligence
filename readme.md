@@ -117,7 +117,7 @@ The system was evaluated against 27 diverse questions sourced from the FinanceBe
 Clone repository and install dependencies:
 
 ```bash
-git clone https://github.com/your-username/filings-iq.git
+git clone https://github.com/Maliksaad69/FilingsIQ-Role-Aware-SEC-Filing-Intelligence.git
 cd filings-iq
 pip install -r requirements.txt
 ```
